@@ -1,7 +1,8 @@
-use std::{time::Instant, path::Path, sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration, time::Instant};
 
 use crate::StdResult;
 use async_trait::async_trait;
+use std::sync::Mutex;
 
 use super::{FileDownloader, FileDownloaderUri};
 
@@ -12,16 +13,6 @@ pub struct FileDownloadRetryPolicy {
     pub attempts: usize,
     /// Delay between two attempts.
     pub delay_between_attempts: Duration,
-}
-
-impl FileDownloadRetryPolicy {
-    // /// Create a policy that never retries.
-    // pub fn never() -> Self {
-    //     Self {
-    //         attempts: 1,
-    //         delay_between_attempts: Duration::from_secs(0),
-    //     }
-    // }
 }
 
 impl Default for FileDownloadRetryPolicy {
@@ -76,8 +67,7 @@ impl FileDownloader for RetryDownloader {
             let duration = start.elapsed();
             println!("  Duration to unpack: {:?}", duration);
             let start = Instant::now();
-            match unpack
-            {
+            match unpack {
                 Ok(result) => return Ok(result),
                 Err(_) if nb_attempts >= retry_policy.attempts => {
                     return Err(anyhow::anyhow!(
@@ -101,7 +91,6 @@ impl FileDownloader for RetryDownloader {
 mod tests {
 
     use crate::{FileUri, MockFileDownloaderBuilder};
-
 
     use super::*;
 
@@ -270,14 +259,113 @@ mod tests {
     #[tokio::test]
     async fn compute_time_when_sleeping() {
         // https://github.com/tokio-rs/tokio/discussions/4473
-        for time_to_sleep in [Duration::from_millis(5), Duration::from_millis(50), Duration::from_millis(100)] {
-        // let time_to_sleep = Duration::from_millis(50);
+        for time_to_sleep in [
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+        ] {
+            // let time_to_sleep = Duration::from_millis(50);
             for i in 0..10 {
                 let start = Instant::now();
                 tokio::time::sleep(time_to_sleep).await;
                 let duration = start.elapsed();
-                println!("Duration during sleep: {:?}", duration);
+                println!(
+                    "Duration during sleep ({}): {:?}",
+                    time_to_sleep.as_millis(),
+                    duration
+                );
             }
         }
     }
+
+    #[tokio::test]
+    async fn compute_time_when_interval_waiting() {
+        // https://github.com/tokio-rs/tokio/discussions/4473
+        for time_to_sleep in [
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+        ] {
+            let mut interval = tokio::time::interval(time_to_sleep);
+            // let time_to_sleep = Duration::from_millis(50);
+            for i in 0..10 {
+                let start = Instant::now();
+                // tokio::time::sleep(time_to_sleep).await;
+                interval.tick().await;
+                let duration = start.elapsed();
+                println!(
+                    "Duration during tick ({}): {:?}",
+                    time_to_sleep.as_millis(),
+                    duration
+                );
+            }
+        }
+    }
+
+    struct MyFileDownloader {
+        expected_delay_between_retry: Duration,
+        nb_attempts: Mutex<i32>,
+        last_start_attempt: Mutex<Option<Instant>>,
+    }
+
+    impl MyFileDownloader {
+        fn new(expected_delay_between_retry: Duration) -> Self {
+            Self {
+                expected_delay_between_retry,
+                nb_attempts: Mutex::new(0),
+                last_start_attempt: Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl FileDownloader for MyFileDownloader {
+        async fn download_unpack(
+            &self,
+            _location: &FileDownloaderUri,
+            _file_size: u64,
+            _target_dir: &Path,
+        ) -> StdResult<()> {
+            let mut last_start_attempt = self.last_start_attempt.lock().unwrap();
+            if let Some(last_start_attempt) = *last_start_attempt {
+                let duration = last_start_attempt.elapsed();
+                assert!(duration >= self.expected_delay_between_retry);
+                assert!(duration < 2 * self.expected_delay_between_retry);
+                println!("  Duration to unpack in MyFileDownloader: {:?}", duration);
+            }
+            *last_start_attempt = Some(Instant::now());
+
+            let mut attempts = self.nb_attempts.lock().unwrap();
+            *attempts += 1;
+
+            Err(anyhow::anyhow!("Download failed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn should_delay_between_retries_with_my_file_downloader() {
+        let delay = Duration::from_millis(50);
+        let mock_file_downloader = Arc::new(MyFileDownloader::new(delay));
+
+        let retry_downloader = RetryDownloader::new(
+            mock_file_downloader.clone(),
+            FileDownloadRetryPolicy {
+                attempts: 4,
+                delay_between_attempts: delay,
+            },
+        );
+
+        retry_downloader
+            .download_unpack(
+                &FileDownloaderUri::FileUri(FileUri("http://whatever/00001.tar.gz".to_string())),
+                0,
+                Path::new("."),
+            )
+            .await
+            .expect_err("An error should be returned when all download attempts fail");
+
+        assert_eq!(4, *mock_file_downloader.nb_attempts.lock().unwrap());
+    }
 }
+
+// https://docs.rs/tokio/latest/tokio/time/fn.interval.html
